@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ACES Power Price Scraper - GitHub Actions Version
+ACES Power Price Scraper - GitHub Actions Version - With Debug
 """
 
 import os
@@ -16,29 +16,33 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 import pandas as pd
 
-# Configuration from environment
+# Configuration
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
 ACES_USER = os.environ.get('ACES_USERNAME')
 ACES_PASS = os.environ.get('ACES_PASSWORD')
 
 DOWNLOAD_DIR = Path('/tmp/aces_downloads')
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+DOWNLOAD_DIR.mkdir(exist_ok=True, parents=True)
 
 def init_browser():
-    """Initialize headless Chrome"""
+    """Initialize headless Chrome with download settings"""
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
     
+    # Critical: Allow multiple downloads without popup
     prefs = {
         "download.default_directory": str(DOWNLOAD_DIR),
         "download.prompt_for_download": False,
         "download.directory_upgrade": True,
         "safebrowsing.enabled": False,
         "profile.default_content_setting_values.automatic_downloads": 1,
+        "profile.content_settings.exceptions.automatic_downloads": {
+            "*.acespower.com,*": {"setting": 1}
+        }
     }
     chrome_options.add_experimental_option("prefs", prefs)
     
@@ -52,61 +56,35 @@ def init_browser():
 def login(driver):
     """Login to ACES portal"""
     print("Logging in...")
-    
-    # Use the correct login URL
     driver.get("https://de.acespower.com/Web/Account/Login.htm")
     time.sleep(3)
     
-    # Find username field (name="username")
     try:
         username_field = driver.find_element(By.NAME, "username")
-        print("Found username field")
-    except Exception as e:
-        raise Exception(f"Could not find username field: {e}")
-    
-    # Find password field (name="password")
-    try:
         password_field = driver.find_element(By.NAME, "password")
-        print("Found password field")
     except Exception as e:
-        raise Exception(f"Could not find password field: {e}")
+        raise Exception(f"Could not find login fields: {e}")
     
-    # Enter credentials
-    username_field.clear()
     username_field.send_keys(ACES_USER)
-    print(f"Entered username")
-    
-    password_field.clear()
     password_field.send_keys(ACES_PASS)
-    print("Entered password")
+    print("Credentials entered")
     
-    # Click login button (id="loginSubmit")
     try:
         login_btn = driver.find_element(By.ID, "loginSubmit")
         login_btn.click()
-        print("Clicked login button")
     except:
-        # Fallback: submit the form
         password_field.submit()
-        print("Submitted form with Enter key")
     
-    # Wait for redirect
     time.sleep(5)
-    
-    # Check current URL
     current_url = driver.current_url
-    print(f"Current URL after login: {current_url}")
+    print(f"URL after login: {current_url}")
     
-    # Check if login succeeded (should NOT be on login page)
-    if "Login" in current_url or "Account/Login" in current_url:
-        driver.save_screenshot("login_failed.png")
-        raise Exception(f"Login failed - still on login page: {current_url}")
-    
+    if "Login" in current_url:
+        raise Exception("Login failed")
     print("Login successful!")
     return True
 
 def get_processed_files(supabase):
-    """Get list of already processed files"""
     try:
         response = supabase.table('processed_files').select('filename').execute()
         return set([f['filename'] for f in response.data])
@@ -115,39 +93,27 @@ def get_processed_files(supabase):
         return set()
 
 def scan_files(driver):
-    """Scan for CSV files in portal"""
     print("Scanning for files...")
-    
-    # Navigate to main page (My Files)
     if "/#/" not in driver.current_url:
-        print("Navigating to main page...")
         driver.get("https://de.acespower.com#/")
         time.sleep(3)
     
-    # Scroll to load all files
-    for _ in range(5):
+    for i in range(5):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(1)
     
-    # Extract file list
     files = driver.execute_script("""
         var results = [];
-        var rows = document.querySelectorAll('tr, .file-row');
-        rows.forEach(function(row) {
+        document.querySelectorAll('tr').forEach(function(row) {
             var text = row.textContent || '';
             var match = text.match(/(NIPS\\.WVPA_(da|rt)_price_forecast_(\\d{14})\\.csv)/);
             if (match) {
-                results.push({
-                    filename: match[1],
-                    type: match[2],
-                    version: match[3]
-                });
+                results.push({filename: match[1], type: match[2], version: match[3]});
             }
         });
         return results;
     """)
     
-    # Remove duplicates
     seen = set()
     unique = []
     for f in files:
@@ -158,8 +124,65 @@ def scan_files(driver):
     print(f"Found {len(unique)} unique files")
     return unique
 
+def download_file(driver, filename):
+    print(f"  Downloading: {filename}")
+    print(f"  Download dir: {DOWNLOAD_DIR}")
+    
+    # Clear previous
+    for f in DOWNLOAD_DIR.glob('*'):
+        f.unlink()
+    
+    # Click using XPath to find the text directly
+    try:
+        # Strategy: Find element containing filename text and click it
+        result = driver.execute_script("""
+            // Try to find by XPath
+            var xpath = "//*[contains(text(), '" + arguments[0] + "')]";
+            var iter = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+            var el = iter.singleNodeValue;
+            if (el) {
+                el.scrollIntoView({block: 'center'});
+                el.click();
+                return 'clicked_text';
+            }
+            return 'not_found';
+        """, filename)
+        
+        print(f"  Click result: {result}")
+        
+        if result == 'not_found':
+            raise Exception("Could not find file element")
+        
+    except Exception as e:
+        print(f"  Click error: {e}")
+        raise
+    
+    # Wait for download
+    print("  Waiting 10s for download...")
+    time.sleep(10)
+    
+    # Check results
+    files = list(DOWNLOAD_DIR.iterdir())
+    print(f"  Files found: {len(files)}")
+    for f in files:
+        print(f"    - {f.name} ({f.stat().st_size} bytes)")
+    
+    csv_files = [f for f in files if f.suffix == '.csv']
+    if csv_files:
+        print(f"  ✓ Downloaded: {csv_files[0].name}")
+        return csv_files[0]
+    
+    # Check for partial downloads
+    partial = [f for f in files if '.crdownload' in f.name]
+    if partial:
+        raise Exception(f"Download incomplete: {partial[0].name}")
+    
+    if files:
+        raise Exception(f"Wrong file type: {[f.name for f in files]}")
+    else:
+        raise Exception("No files downloaded")
+
 def parse_filename(filename):
-    """Parse version from filename"""
     match = re.match(r'NIPS\.WVPA_(da|rt)_price_forecast_(\d{14})\.csv', filename)
     if match:
         version_str = match.group(2)
@@ -174,41 +197,12 @@ def parse_filename(filename):
         }
     return None
 
-def download_file(driver, filename):
-    """Download a single file"""
-    # Clear previous downloads
-    for f in DOWNLOAD_DIR.glob('*.csv'):
-        f.unlink()
-    
-    # Click the file row
-    clicked = driver.execute_script("""
-        var rows = document.querySelectorAll('tr, .file-row');
-        for (var i = 0; i < rows.length; i++) {
-            if (rows[i].textContent.includes(arguments[0])) {
-                var buttons = rows[i].querySelectorAll('button');
-                if (buttons.length > 0) {
-                    buttons[buttons.length - 1].click();
-                    return true;
-                }
-            }
-        }
-        return false;
-    """, filename)
-    
-    if not clicked:
-        return None
-    
-    time.sleep(3)
-    
-    files = list(DOWNLOAD_DIR.glob('*.csv'))
-    return files[0] if files else None
-
 def process_csv(filepath, file_info):
-    """Parse CSV and prepare for insertion"""
     try:
+        print(f"    Reading: {filepath}")
         df = pd.read_csv(filepath)
+        print(f"    Shape: {df.shape}, Columns: {list(df.columns)}")
         
-        # Detect columns
         time_col = None
         price_col = None
         
@@ -228,7 +222,6 @@ def process_csv(filepath, file_info):
         for _, row in df.iterrows():
             try:
                 target_time = pd.to_datetime(row[time_col])
-                
                 rows.append({
                     'target_timestamp': target_time.isoformat(),
                     'price': float(row[price_col]) if pd.notna(row[price_col]) else None,
@@ -243,93 +236,75 @@ def process_csv(filepath, file_info):
             except:
                 continue
         
+        print(f"    Parsed {len(rows)} rows")
         return rows
     except Exception as e:
-        print(f"Error parsing CSV: {e}")
+        print(f"    Parse error: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 def main():
     print("=" * 60)
-    print("ACES Price Scraper Starting")
+    print("ACES Price Scraper")
     print("=" * 60)
     
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     processed = get_processed_files(supabase)
-    print(f"Already processed: {len(processed)} files")
+    print(f"Already processed: {len(processed)}")
     
     driver = init_browser()
     
     try:
         login(driver)
-        
         all_files = scan_files(driver)
-        print(f"Found {len(all_files)} files in portal")
-        
         new_files = [f for f in all_files if f['filename'] not in processed]
-        print(f"New files to process: {len(new_files)}")
+        print(f"New files: {len(new_files)}")
         
         if not new_files:
-            print("No new files to process")
+            print("Nothing to process")
             return
         
-        results = {'success': 0, 'failed': 0, 'da': 0, 'rt': 0}
+        # Test with just first file
+        test_file = new_files[0]
+        print(f"\nTesting with: {test_file['filename']}")
         
-        for file_meta in new_files:
-            print(f"\nProcessing: {file_meta['filename']}")
+        try:
+            filepath = download_file(driver, test_file['filename'])
+            file_info = parse_filename(test_file['filename'])
+            rows = process_csv(filepath, {**file_info, 'filename': test_file['filename']})
             
-            try:
-                filepath = download_file(driver, file_meta['filename'])
-                if not filepath:
-                    raise Exception("Download failed")
-                
-                file_info = parse_filename(file_meta['filename'])
-                if not file_info:
-                    raise Exception("Could not parse filename")
-                
-                rows = process_csv(filepath, {**file_info, 'filename': file_meta['filename']})
-                
-                if not rows:
-                    raise Exception("No data parsed")
-                
+            if rows:
                 table = 'da_price_forecasts' if file_info['type'] == 'da' else 'rt_price_forecasts'
+                print(f"  Inserting into {table}")
                 
-                response = supabase.table(table).upsert(
-                    rows,
-                    on_conflict='target_timestamp,version,location'
-                ).execute()
+                response = supabase.table(table).upsert(rows, on_conflict='target_timestamp,version,location').execute()
+                print(f"  Insert response: {response}")
                 
                 supabase.table('processed_files').insert({
-                    'filename': file_meta['filename'],
+                    'filename': test_file['filename'],
                     'file_type': file_info['type'],
-                    'file_size_bytes': filepath.stat().st_size,
                     'row_count': len(rows),
                     'import_status': 'success'
                 }).execute()
                 
-                print(f"  ✓ Inserted {len(rows)} rows to {table}")
-                results['success'] += 1
-                results[file_info['type']] += 1
-                
-                filepath.unlink()
-                
-            except Exception as e:
-                print(f"  ✗ Failed: {e}")
-                results['failed'] += 1
-                
-                try:
-                    supabase.table('processed_files').insert({
-                        'filename': file_meta['filename'],
-                        'file_type': file_meta.get('type', 'unknown'),
-                        'import_status': 'failed',
-                        'row_count': 0
-                    }).execute()
-                except:
-                    pass
-        
-        print("\n" + "=" * 60)
-        print(f"Results: {results['success']} success, {results['failed']} failed")
-        print(f"DA: {results['da']}, RT: {results['rt']}")
-        print("=" * 60)
+                print("  ✓ SUCCESS")
+            else:
+                print("  ✗ No rows to insert")
+            
+            filepath.unlink()
+            
+        except Exception as e:
+            print(f"  ✗ FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            supabase.table('processed_files').insert({
+                'filename': test_file['filename'],
+                'file_type': test_file.get('type', 'unknown'),
+                'import_status': 'failed',
+                'row_count': 0
+            }).execute()
         
     finally:
         driver.quit()
