@@ -52,26 +52,57 @@ def init_browser():
 def login(driver):
     """Login to ACES portal"""
     print("Logging in...")
-    driver.get("https://de.acespower.com/#/login")
-    time.sleep(2)
     
-    inputs = driver.find_elements(By.TAG_NAME, "input")
-    if len(inputs) >= 2:
-        inputs[0].send_keys(ACES_USER)
-        inputs[1].send_keys(ACES_PASS)
-    
-    buttons = driver.find_elements(By.CSS_SELECTOR, 'button')
-    for btn in buttons:
-        if btn.is_displayed():
-            btn.click()
-            break
-    
+    # Use the correct login URL
+    driver.get("https://de.acespower.com/Web/Account/Login.htm")
     time.sleep(3)
     
-    if "/login" in driver.current_url:
-        raise Exception("Login failed")
+    # Find username field (name="username")
+    try:
+        username_field = driver.find_element(By.NAME, "username")
+        print("Found username field")
+    except Exception as e:
+        raise Exception(f"Could not find username field: {e}")
     
-    print("Login successful")
+    # Find password field (name="password")
+    try:
+        password_field = driver.find_element(By.NAME, "password")
+        print("Found password field")
+    except Exception as e:
+        raise Exception(f"Could not find password field: {e}")
+    
+    # Enter credentials
+    username_field.clear()
+    username_field.send_keys(ACES_USER)
+    print(f"Entered username")
+    
+    password_field.clear()
+    password_field.send_keys(ACES_PASS)
+    print("Entered password")
+    
+    # Click login button (id="loginSubmit")
+    try:
+        login_btn = driver.find_element(By.ID, "loginSubmit")
+        login_btn.click()
+        print("Clicked login button")
+    except:
+        # Fallback: submit the form
+        password_field.submit()
+        print("Submitted form with Enter key")
+    
+    # Wait for redirect
+    time.sleep(5)
+    
+    # Check current URL
+    current_url = driver.current_url
+    print(f"Current URL after login: {current_url}")
+    
+    # Check if login succeeded (should NOT be on login page)
+    if "Login" in current_url or "Account/Login" in current_url:
+        driver.save_screenshot("login_failed.png")
+        raise Exception(f"Login failed - still on login page: {current_url}")
+    
+    print("Login successful!")
     return True
 
 def get_processed_files(supabase):
@@ -87,12 +118,14 @@ def scan_files(driver):
     """Scan for CSV files in portal"""
     print("Scanning for files...")
     
+    # Navigate to main page (My Files)
     if "/#/" not in driver.current_url:
-        driver.get("https://de.acespower.com/#/")
-        time.sleep(2)
+        print("Navigating to main page...")
+        driver.get("https://de.acespower.com#/")
+        time.sleep(3)
     
-    # Scroll to load all
-    for _ in range(3):
+    # Scroll to load all files
+    for _ in range(5):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(1)
     
@@ -122,6 +155,7 @@ def scan_files(driver):
             seen.add(f['filename'])
             unique.append(f)
     
+    print(f"Found {len(unique)} unique files")
     return unique
 
 def parse_filename(filename):
