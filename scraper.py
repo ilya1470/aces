@@ -8,7 +8,7 @@ import time
 import re
 import base64
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from supabase import create_client
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -16,6 +16,8 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 import pandas as pd
+import glob
+import traceback
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
@@ -119,7 +121,7 @@ def download_file_js(driver, filename):
     result = driver.execute_script("""
         var filename = arguments[0];
         
-        // Strategy 1: Find by text content and click parent
+        # Strategy 1: Find by text content and click parent
         var allElements = document.querySelectorAll('*');
         for (var i = 0; i < allElements.length; i++) {
             var el = allElements[i];
@@ -130,13 +132,13 @@ def download_file_js(driver, filename):
             }
         }
         
-        // Strategy 2: Find containing element
+        # Strategy 2: Find containing element
         var rows = document.querySelectorAll('tr, .file-row, [role="row"]');
         for (var i = 0; i < rows.length; i++) {
             if (rows[i].textContent.includes(filename)) {
                 console.log('Found row:', rows[i]);
                 
-                // Try double click
+                # Try double click
                 var event = new MouseEvent('dblclick', {
                     'view': window,
                     'bubbles': true,
@@ -154,7 +156,6 @@ def download_file_js(driver, filename):
     time.sleep(5)
     
     # Check for downloaded file
-    import glob
     files = glob.glob('/tmp/*.csv') + glob.glob('/tmp/*.crdownload')
     print(f"  Files found: {files}")
     
@@ -290,7 +291,6 @@ def download_file_direct_click(driver, filename):
         time.sleep(5)
         
         # Check for download
-        import glob
         files = glob.glob('/tmp/*.csv') + glob.glob('/tmp/*.crdownload')
         print(f"  Files after click: {files}")
         
@@ -329,37 +329,36 @@ def process_csv_content(content, file_info):
         df = pd.read_csv(temp_path)
         print(f"    Shape: {df.shape}, Columns: {list(df.columns)}")
         
-        time_col = None
-        price_col = None
-        
-        for col in df.columns:
-            col_lower = col.lower()
-            if any(x in col_lower for x in ['time', 'date', 'period', 'datetime']):
-                time_col = col
-            elif any(x in col_lower for x in ['price', 'lmp', 'total']):
-                price_col = col
-        
-        if not time_col:
-            time_col = df.columns[0]
-        if not price_col:
-            price_col = df.columns[1]
-        
+        # Map your CSV columns
         rows = []
         for _, row in df.iterrows():
             try:
-                target_time = pd.to_datetime(row[time_col])
+                # Parse date and hour
+                date_str = str(row['date'])  # Format likely YYYY-MM-DD
+                hour = int(row['he'])  # Hour ending
+                
+                # Construct datetime
+                from datetime import datetime
+                date_parts = date_str.split('-')
+                target_time = datetime(
+                    int(date_parts[0]), int(date_parts[1]), int(date_parts[2]),
+                    hour - 1, 0, 0  # HE15 = 14:00-15:00, so use hour-1
+                )
+                
                 rows.append({
                     'target_timestamp': target_time.isoformat(),
-                    'price': float(row[price_col]) if pd.notna(row[price_col]) else None,
+                    'hour': hour,
+                    'price': float(row['kw']) if 'kw' in row else float(row['mw']) if 'mw' in row else None,
                     'congestion_price': None,
                     'loss_price': None,
                     'energy_price': None,
-                    'location': 'NIPS.WVPA',
+                    'location': str(row['node']) if 'node' in row else 'NIPS.WVPA',
                     'forecast_timestamp': file_info['forecast_timestamp'].isoformat(),
                     'version': file_info['version'],
                     'filename': file_info['filename']
                 })
-            except:
+            except Exception as e:
+                print(f"    Row error: {e}")
                 continue
         
         temp_path.unlink()
@@ -367,7 +366,6 @@ def process_csv_content(content, file_info):
         return rows
     except Exception as e:
         print(f"    Parse error: {e}")
-        import traceback
         traceback.print_exc()
         return []
 
@@ -429,7 +427,7 @@ def main():
             
             response = supabase.table(table).upsert(
                 rows, 
-                on_conflict='target_timestamp,version,location'
+                on_conflict='target_timestamp,version,location,hour'  # Added hour to conflict constraint
             ).execute()
             
             print(f"Response: {response}")
@@ -448,10 +446,10 @@ def main():
             
     except Exception as e:
         print(f"\n✗ FAILED: {e}")
-        import traceback
         traceback.print_exc()
         
         try:
+            # Safely attempt to log failure
             supabase.table('processed_files').insert({
                 'filename': test_file['filename'],
                 'file_type': test_file.get('type', 'unknown'),
