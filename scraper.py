@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-ACES Power Price Scraper - GitHub Actions Version - With Debug
+ACES Power Price Scraper - API-based download approach
 """
 
 import os
 import time
 import re
+import requests
 from pathlib import Path
 from datetime import datetime
 from supabase import create_client
@@ -22,29 +23,12 @@ SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
 ACES_USER = os.environ.get('ACES_USERNAME')
 ACES_PASS = os.environ.get('ACES_PASSWORD')
 
-DOWNLOAD_DIR = Path('/tmp/aces_downloads')
-DOWNLOAD_DIR.mkdir(exist_ok=True, parents=True)
-
 def init_browser():
-    """Initialize headless Chrome with download settings"""
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
-    
-    # Critical: Allow multiple downloads without popup
-    prefs = {
-        "download.default_directory": str(DOWNLOAD_DIR),
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
-        "safebrowsing.enabled": False,
-        "profile.default_content_setting_values.automatic_downloads": 1,
-        "profile.content_settings.exceptions.automatic_downloads": {
-            "*.acespower.com,*": {"setting": 1}
-        }
-    }
-    chrome_options.add_experimental_option("prefs", prefs)
     
     driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
@@ -54,26 +38,17 @@ def init_browser():
     return driver
 
 def login(driver):
-    """Login to ACES portal"""
     print("Logging in...")
     driver.get("https://de.acespower.com/Web/Account/Login.htm")
     time.sleep(3)
     
-    try:
-        username_field = driver.find_element(By.NAME, "username")
-        password_field = driver.find_element(By.NAME, "password")
-    except Exception as e:
-        raise Exception(f"Could not find login fields: {e}")
-    
-    username_field.send_keys(ACES_USER)
-    password_field.send_keys(ACES_PASS)
-    print("Credentials entered")
+    driver.find_element(By.NAME, "username").send_keys(ACES_USER)
+    driver.find_element(By.NAME, "password").send_keys(ACES_PASS)
     
     try:
-        login_btn = driver.find_element(By.ID, "loginSubmit")
-        login_btn.click()
+        driver.find_element(By.ID, "loginSubmit").click()
     except:
-        password_field.submit()
+        driver.find_element(By.NAME, "password").submit()
     
     time.sleep(5)
     current_url = driver.current_url
@@ -98,6 +73,7 @@ def scan_files(driver):
         driver.get("https://de.acespower.com#/")
         time.sleep(3)
     
+    # Scroll to load all
     for i in range(5):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(1)
@@ -124,63 +100,88 @@ def scan_files(driver):
     print(f"Found {len(unique)} unique files")
     return unique
 
-def download_file(driver, filename):
-    print(f"  Downloading: {filename}")
-    print(f"  Download dir: {DOWNLOAD_DIR}")
+def download_file_api(driver, filename):
+    """
+    Strategy: Use browser to get cookies/session, then fetch file via HTTP request
+    """
+    print(f"  Attempting download via API: {filename}")
     
-    # Clear previous
-    for f in DOWNLOAD_DIR.glob('*'):
-        f.unlink()
+    # Get cookies from selenium
+    cookies = driver.get_cookies()
+    cookie_dict = {c['name']: c['value'] for c in cookies}
+    print(f"  Got {len(cookies)} cookies")
     
-    # Click using XPath to find the text directly
+    # Try to find download URL or construct it
+    # Common patterns for file download APIs
+    encoded_filename = requests.utils.quote(filename)
+    
+    possible_urls = [
+        f"https://de.acespower.com/api/files/download/{encoded_filename}",
+        f"https://de.acespower.com/api/download?file={encoded_filename}",
+        f"https://de.acespower.com/download/{encoded_filename}",
+        f"https://de.acespower.com/files/{encoded_filename}",
+        f"https://de.acespower.com/api/v1/files/{encoded_filename}",
+    ]
+    
+    # Try to intercept the actual download URL by clicking and monitoring
+    print("  Trying to intercept download URL...")
+    
+    # Click the file to see if we can catch the URL
     try:
-        # Strategy: Find element containing filename text and click it
-        result = driver.execute_script("""
-            // Try to find by XPath
-            var xpath = "//*[contains(text(), '" + arguments[0] + "')]";
-            var iter = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-            var el = iter.singleNodeValue;
-            if (el) {
-                el.scrollIntoView({block: 'center'});
-                el.click();
-                return 'clicked_text';
+        # Execute click and check network (we can't really do this in Selenium easily)
+        # Instead, let's try to find any links or buttons with download URLs
+        download_url = driver.execute_script("""
+            var rows = document.querySelectorAll('tr');
+            for (var i = 0; i < rows.length; i++) {
+                if (rows[i].textContent.includes(arguments[0])) {
+                    // Look for download links
+                    var links = rows[i].querySelectorAll('a[href], button[data-url]');
+                    for (var j = 0; j < links.length; j++) {
+                        var url = links[j].getAttribute('href') || links[j].getAttribute('data-url') || '';
+                        if (url && (url.includes('.csv') || url.includes('download'))) {
+                            return url;
+                        }
+                    }
+                    // Try onclick handlers
+                    var onclick = links[j].getAttribute('onclick') || '';
+                    var match = onclick.match(/['\"]([^'\"]*download[^'\"]*)['\"]/);
+                    if (match) return match[1];
+                }
             }
-            return 'not_found';
+            return null;
         """, filename)
         
-        print(f"  Click result: {result}")
-        
-        if result == 'not_found':
-            raise Exception("Could not find file element")
-        
+        if download_url:
+            print(f"  Found download URL: {download_url}")
+            if not download_url.startswith('http'):
+                download_url = f"https://de.acespower.com{download_url}"
+            possible_urls.insert(0, download_url)
     except Exception as e:
-        print(f"  Click error: {e}")
-        raise
+        print(f"  Could not intercept URL: {e}")
     
-    # Wait for download
-    print("  Waiting 10s for download...")
-    time.sleep(10)
+    # Try each URL
+    session = requests.Session()
+    for c in cookies:
+        session.cookies.set(c['name'], c['value'])
     
-    # Check results
-    files = list(DOWNLOAD_DIR.iterdir())
-    print(f"  Files found: {len(files)}")
-    for f in files:
-        print(f"    - {f.name} ({f.stat().st_size} bytes)")
+    for url in possible_urls:
+        print(f"  Trying: {url[:80]}...")
+        try:
+            response = session.get(url, timeout=30, allow_redirects=True)
+            if response.status_code == 200:
+                content_type = response.headers.get('content-type', '').lower()
+                if 'csv' in content_type or filename in response.headers.get('content-disposition', ''):
+                    print(f"  ✓ Downloaded {len(response.content)} bytes")
+                    return response.content
+                elif len(response.content) > 100 and b',' in response.content[:1000]:
+                    # Likely CSV even if content-type is wrong
+                    print(f"  ✓ Downloaded {len(response.content)} bytes (detected CSV)")
+                    return response.content
+        except Exception as e:
+            print(f"    Failed: {e}")
+            continue
     
-    csv_files = [f for f in files if f.suffix == '.csv']
-    if csv_files:
-        print(f"  ✓ Downloaded: {csv_files[0].name}")
-        return csv_files[0]
-    
-    # Check for partial downloads
-    partial = [f for f in files if '.crdownload' in f.name]
-    if partial:
-        raise Exception(f"Download incomplete: {partial[0].name}")
-    
-    if files:
-        raise Exception(f"Wrong file type: {[f.name for f in files]}")
-    else:
-        raise Exception("No files downloaded")
+    raise Exception("Could not download file via any URL")
 
 def parse_filename(filename):
     match = re.match(r'NIPS\.WVPA_(da|rt)_price_forecast_(\d{14})\.csv', filename)
@@ -197,18 +198,23 @@ def parse_filename(filename):
         }
     return None
 
-def process_csv(filepath, file_info):
+def process_csv_content(content, file_info):
+    """Process CSV from bytes"""
     try:
-        print(f"    Reading: {filepath}")
-        df = pd.read_csv(filepath)
+        # Save to temp file for pandas
+        temp_path = Path('/tmp') / file_info['filename']
+        temp_path.write_bytes(content)
+        
+        df = pd.read_csv(temp_path)
         print(f"    Shape: {df.shape}, Columns: {list(df.columns)}")
         
+        # Detect columns
         time_col = None
         price_col = None
         
         for col in df.columns:
             col_lower = col.lower()
-            if any(x in col_lower for x in ['time', 'date', 'period']):
+            if any(x in col_lower for x in ['time', 'date', 'period', 'datetime']):
                 time_col = col
             elif any(x in col_lower for x in ['price', 'lmp', 'total']):
                 price_col = col
@@ -217,6 +223,8 @@ def process_csv(filepath, file_info):
             time_col = df.columns[0]
         if not price_col:
             price_col = df.columns[1]
+        
+        print(f"    Using: time={time_col}, price={price_col}")
         
         rows = []
         for _, row in df.iterrows():
@@ -233,11 +241,14 @@ def process_csv(filepath, file_info):
                     'version': file_info['version'],
                     'filename': file_info['filename']
                 })
-            except:
+            except Exception as e:
+                print(f"    Row error: {e}")
                 continue
         
+        temp_path.unlink()
         print(f"    Parsed {len(rows)} rows")
         return rows
+        
     except Exception as e:
         print(f"    Parse error: {e}")
         import traceback
@@ -246,7 +257,7 @@ def process_csv(filepath, file_info):
 
 def main():
     print("=" * 60)
-    print("ACES Price Scraper")
+    print("ACES Price Scraper - API Approach")
     print("=" * 60)
     
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -265,35 +276,42 @@ def main():
             print("Nothing to process")
             return
         
-        # Test with just first file
+        # Test first file
         test_file = new_files[0]
-        print(f"\nTesting with: {test_file['filename']}")
+        print(f"\nTesting: {test_file['filename']}")
         
         try:
-            filepath = download_file(driver, test_file['filename'])
+            # Download via API
+            content = download_file_api(driver, test_file['filename'])
+            
+            # Parse
             file_info = parse_filename(test_file['filename'])
-            rows = process_csv(filepath, {**file_info, 'filename': test_file['filename']})
+            rows = process_csv_content(content, {**file_info, 'filename': test_file['filename']})
             
             if rows:
                 table = 'da_price_forecasts' if file_info['type'] == 'da' else 'rt_price_forecasts'
-                print(f"  Inserting into {table}")
+                print(f"  Inserting {len(rows)} rows into {table}")
                 
-                response = supabase.table(table).upsert(rows, on_conflict='target_timestamp,version,location').execute()
-                print(f"  Insert response: {response}")
+                response = supabase.table(table).upsert(
+                    rows, 
+                    on_conflict='target_timestamp,version,location'
+                ).execute()
                 
+                print(f"  Response: {response}")
+                
+                # Mark as processed
                 supabase.table('processed_files').insert({
                     'filename': test_file['filename'],
                     'file_type': file_info['type'],
+                    'file_size_bytes': len(content),
                     'row_count': len(rows),
                     'import_status': 'success'
                 }).execute()
                 
                 print("  ✓ SUCCESS")
             else:
-                print("  ✗ No rows to insert")
-            
-            filepath.unlink()
-            
+                raise Exception("No data parsed")
+                
         except Exception as e:
             print(f"  ✗ FAILED: {e}")
             import traceback
@@ -302,8 +320,9 @@ def main():
             supabase.table('processed_files').insert({
                 'filename': test_file['filename'],
                 'file_type': test_file.get('type', 'unknown'),
-                'import_status': 'failed',
-                'row_count': 0
+                'file_size_bytes': 0,
+                'row_count': 0,
+                'import_status': 'failed'
             }).execute()
         
     finally:
