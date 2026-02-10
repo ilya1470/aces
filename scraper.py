@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-ACES Power Price Scraper - Inspecting download mechanism
+ACES Power Price Scraper - Advanced download methods
 """
 
 import os
 import time
 import re
-import requests
+import base64
 from pathlib import Path
 from datetime import datetime
 from supabase import create_client
@@ -28,6 +28,11 @@ def init_browser():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
+    # Disable download prompt in headless
+    chrome_options.add_experimental_option("prefs", {
+        "download.prompt_for_download": False,
+        "safebrowsing.enabled": False
+    })
     
     driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
@@ -98,173 +103,206 @@ def scan_files(driver):
     print(f"Found {len(unique)} unique files")
     return unique
 
-def inspect_download_mechanism(driver, filename):
+def download_file_js(driver, filename):
     """
-    Inspect the page to understand how downloads work
+    Use JavaScript to trigger download and capture as base64
     """
-    print(f"  Inspecting download mechanism for: {filename}")
+    print(f"  Attempting JS download: {filename}")
     
-    # Get row HTML and all attributes
-    row_info = driver.execute_script("""
-        var rows = document.querySelectorAll('tr');
-        for (var i = 0; i < rows.length; i++) {
-            if (rows[i].textContent.includes(arguments[0])) {
-                var info = {
-                    rowHTML: rows[i].outerHTML.substring(0, 500),
-                    buttons: [],
-                    links: []
-                };
-                
-                // Get all buttons
-                var buttons = rows[i].querySelectorAll('button');
-                buttons.forEach(function(btn, idx) {
-                    info.buttons.push({
-                        index: idx,
-                        text: btn.textContent,
-                        onclick: btn.getAttribute('onclick'),
-                        class: btn.className,
-                        id: btn.id,
-                        dataAttrs: {}
-                    });
-                    // Get all data-* attributes
-                    for (var j = 0; j < btn.attributes.length; j++) {
-                        var attr = btn.attributes[j];
-                        if (attr.name.startsWith('data-')) {
-                            info.buttons[idx].dataAttrs[attr.name] = attr.value;
-                        }
-                    }
-                });
-                
-                // Get all links
-                var links = rows[i].querySelectorAll('a');
-                links.forEach(function(link, idx) {
-                    info.links.push({
-                        index: idx,
-                        href: link.getAttribute('href'),
-                        text: link.textContent,
-                        onclick: link.getAttribute('onclick')
-                    });
-                });
-                
-                return info;
-            }
-        }
-        return null;
-    """, filename)
-    
-    print(f"  Row inspection result:")
-    print(f"    Buttons found: {len(row_info['buttons'])}")
-    for btn in row_info['buttons']:
-        print(f"      Button {btn['index']}: text='{btn['text']}', onclick='{btn['onclick']}', data={btn['dataAttrs']}")
-    
-    print(f"    Links found: {len(row_info['links'])}")
-    for link in row_info['links']:
-        print(f"      Link {link['index']}: href='{link['href']}', text='{link['text']}'")
-    
-    # Try to construct download URL from patterns
-    # Look for data-file-id or similar
-    file_id = None
-    for btn in row_info['buttons']:
-        if 'data-file-id' in btn['dataAttrs']:
-            file_id = btn['dataAttrs']['data-file-id']
-            break
-        if 'data-id' in btn['dataAttrs']:
-            file_id = btn['dataAttrs']['data-id']
-            break
-    
-    return row_info, file_id
-
-def download_file_cdp(driver, filename):
-    """
-    Use Chrome DevTools Protocol to capture download
-    """
-    print(f"  Attempting download via CDP: {filename}")
-    
-    # Enable CDP download handling
+    # Enable download behavior
     driver.execute_cdp_cmd('Page.setDownloadBehavior', {
         'behavior': 'allow',
         'downloadPath': '/tmp'
     })
     
-    # Click using JavaScript
-    click_result = driver.execute_script("""
-        var rows = document.querySelectorAll('tr');
-        for (var i = 0; i < rows.length; i++) {
-            if (rows[i].textContent.includes(arguments[0])) {
-                // Try clicking the text itself
-                var xpath = "//td[contains(text(), '" + arguments[0] + "')]";
-                var result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-                var el = result.singleNodeValue;
-                if (el) {
-                    el.click();
-                    return 'clicked_xpath';
-                }
-                
-                // Try clicking parent
-                rows[i].click();
-                return 'clicked_row';
+    # Try clicking with different strategies
+    result = driver.execute_script("""
+        var filename = arguments[0];
+        
+        // Strategy 1: Find by text content and click parent
+        var allElements = document.querySelectorAll('*');
+        for (var i = 0; i < allElements.length; i++) {
+            var el = allElements[i];
+            if (el.children.length === 0 && el.textContent.trim() === filename) {
+                console.log('Found exact text match:', el);
+                el.click();
+                return 'clicked_exact_text';
             }
         }
+        
+        // Strategy 2: Find containing element
+        var rows = document.querySelectorAll('tr, .file-row, [role="row"]');
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].textContent.includes(filename)) {
+                console.log('Found row:', rows[i]);
+                
+                // Try double click
+                var event = new MouseEvent('dblclick', {
+                    'view': window,
+                    'bubbles': true,
+                    'cancelable': true
+                });
+                rows[i].dispatchEvent(event);
+                return 'dblclicked_row';
+            }
+        }
+        
         return 'not_found';
     """, filename)
     
-    print(f"  Click result: {click_result}")
-    time.sleep(10)
+    print(f"  Click result: {result}")
+    time.sleep(5)
     
     # Check for downloaded file
     import glob
     files = glob.glob('/tmp/*.csv') + glob.glob('/tmp/*.crdownload')
-    print(f"  Files in /tmp: {files}")
+    print(f"  Files found: {files}")
     
     if files:
-        # Get the most recent
         files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-        return Path(files[0])
+        latest = Path(files[0])
+        content = latest.read_bytes()
+        latest.unlink()
+        return content
     
     return None
 
-def download_via_requests(driver, filename, file_info):
+def download_file_fetch(driver, filename):
     """
-    Try to construct and use direct download URL
+    Use fetch API to download file and return base64
     """
-    print(f"  Trying direct HTTP download")
+    print(f"  Attempting fetch download: {filename}")
     
-    # Get cookies
-    cookies = driver.get_cookies()
-    session = requests.Session()
-    for c in cookies:
-        session.cookies.set(c['name'], c['value'])
+    # Get base URL and cookies
+    base_url = driver.current_url
     
-    # Common patterns for Web Transfer Client
-    encoded = requests.utils.quote(filename)
+    # Try to find download URL patterns from the page
+    result = driver.execute_async_script("""
+        var callback = arguments[arguments.length - 1];
+        var filename = arguments[0];
+        
+        // Look for any elements that might have download URLs
+        var elements = document.querySelectorAll('[ng-click], [onclick], [data-download]');
+        var urls = [];
+        
+        elements.forEach(function(el) {
+            var onclick = el.getAttribute('onclick') || '';
+            var ngClick = el.getAttribute('ng-click') || '';
+            var dataDownload = el.getAttribute('data-download') || '';
+            
+            if (onclick.includes('download') || ngClick.includes('download') || dataDownload) {
+                urls.push({
+                    onclick: onclick,
+                    ngClick: ngClick,
+                    dataDownload: dataDownload,
+                    text: el.textContent.substring(0, 50)
+                });
+            }
+        });
+        
+        // Try to trigger download using fetch
+        // First, let's look for the file in any exposed JavaScript variables
+        var fileData = null;
+        if (window.files && window.files[filename]) {
+            fileData = window.files[filename];
+        }
+        
+        callback({
+            urls: urls,
+            fileData: fileData,
+            windowKeys: Object.keys(window).filter(k => k.toLowerCase().includes('file')).slice(0, 10)
+        });
+    """, filename)
     
-    # Try different URL patterns
-    urls = [
-        f"https://de.acespower.com/Files/Download/{encoded}",
-        f"https://de.acespower.com/Download/{encoded}",
-        f"https://de.acespower.com/api/Files/{encoded}",
-        f"https://de.acespower.com/api/files/{file_info['version']}",
-        f"https://de.acespower.com/handlers/download.ashx?file={encoded}",
-        f"https://de.acespower.com/download.aspx?file={encoded}",
-    ]
+    print(f"  Page analysis: {result}")
     
-    for url in urls:
-        print(f"    Trying: {url}")
-        try:
-            r = session.get(url, timeout=30, allow_redirects=True)
-            print(f"    Status: {r.status_code}, Size: {len(r.content)}")
-            if r.status_code == 200 and len(r.content) > 100:
-                content_type = r.headers.get('content-type', '')
-                content_disp = r.headers.get('content-disposition', '')
-                if 'csv' in content_type.lower() or 'csv' in content_disp.lower() or filename in content_disp:
-                    print(f"    ✓ Success!")
-                    return r.content
-                # Check if content looks like CSV
-                if b',' in r.content[:1000] and len(r.content) > 500:
-                    print(f"    ✓ Looks like CSV")
-                    return r.content
-        except Exception as e:
-            print(f"    Error: {e}")
+    # If we found URL patterns, try to construct download URL
+    # Try common patterns for Web Transfer / Angular apps
+    encoded = filename.replace('.', '%2E').replace('_', '%5F')
+    
+    # Use browser's fetch with cookies
+    fetch_result = driver.execute_async_script("""
+        var callback = arguments[arguments.length - 1];
+        var filename = arguments[0];
+        
+        // Try to download using fetch
+        fetch('/api/files/' + filename, {
+            method: 'GET',
+            credentials: 'include'
+        })
+        .then(function(response) {
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            return response.blob();
+        })
+        .then(function(blob) {
+            var reader = new FileReader();
+            reader.onloadend = function() {
+                callback({success: true, data: reader.result});
+            };
+            reader.readAsDataURL(blob);
+        })
+        .catch(function(error) {
+            callback({success: false, error: error.toString()});
+        });
+    """, filename)
+    
+    print(f"  Fetch result: {fetch_result}")
+    
+    if fetch_result and fetch_result.get('success'):
+        # Decode base64 data
+        data_url = fetch_result['data']
+        if ',' in data_url:
+            base64_data = data_url.split(',')[1]
+            return base64.b64decode(base64_data)
+    
+    return None
+
+def download_file_direct_click(driver, filename):
+    """
+    Direct click with mouse simulation
+    """
+    print(f"  Attempting direct click: {filename}")
+    
+    # Save screenshot before
+    driver.save_screenshot('/tmp/before_click.png')
+    print("  Screenshot saved: before_click.png")
+    
+    # Find element and click using ActionChains
+    from selenium.webdriver.common.action_chains import ActionChains
+    
+    try:
+        # Find element containing the text
+        element = driver.find_element(By.XPATH, f"//*[contains(text(), '{filename}')]")
+        print(f"  Found element: {element.tag_name}")
+        
+        # Scroll into view
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+        time.sleep(1)
+        
+        # Save screenshot after scroll
+        driver.save_screenshot('/tmp/after_scroll.png')
+        
+        # Click using ActionChains
+        actions = ActionChains(driver)
+        actions.move_to_element(element).click().perform()
+        print("  Clicked element")
+        
+        time.sleep(5)
+        
+        # Check for download
+        import glob
+        files = glob.glob('/tmp/*.csv') + glob.glob('/tmp/*.crdownload')
+        print(f"  Files after click: {files}")
+        
+        if files:
+            files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            latest = Path(files[0])
+            content = latest.read_bytes()
+            latest.unlink()
+            return content
+            
+    except Exception as e:
+        print(f"  Direct click error: {e}")
     
     return None
 
@@ -286,10 +324,7 @@ def parse_filename(filename):
 def process_csv_content(content, file_info):
     try:
         temp_path = Path('/tmp') / file_info['filename']
-        if isinstance(content, bytes):
-            temp_path.write_bytes(content)
-        else:
-            temp_path.write_text(content)
+        temp_path.write_bytes(content)
         
         df = pd.read_csv(temp_path)
         print(f"    Shape: {df.shape}, Columns: {list(df.columns)}")
@@ -338,7 +373,7 @@ def process_csv_content(content, file_info):
 
 def main():
     print("=" * 60)
-    print("ACES Price Scraper - Inspection Mode")
+    print("ACES Price Scraper - Advanced Methods")
     print("=" * 60)
     
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -357,35 +392,32 @@ def main():
             print("Nothing to process")
             return
         
-        # Test first file
+        # Test first file with multiple methods
         test_file = new_files[0]
         print(f"\n{'='*60}")
         print(f"Testing: {test_file['filename']}")
         print(f"{'='*60}")
         
-        # Step 1: Inspect the download mechanism
-        row_info, file_id = inspect_download_mechanism(driver, test_file['filename'])
-        
-        if file_id:
-            print(f"\n  Found file_id: {file_id}")
-        
-        # Step 2: Try CDP download
-        print(f"\n  Attempting CDP download...")
-        downloaded = download_file_cdp(driver, test_file['filename'])
-        
         content = None
-        if downloaded:
-            print(f"  ✓ CDP download worked: {downloaded}")
-            content = downloaded.read_bytes()
-            downloaded.unlink()
-        else:
-            print(f"  ✗ CDP failed, trying HTTP...")
-            # Step 3: Try HTTP requests
-            file_info = parse_filename(test_file['filename'])
-            content = download_via_requests(driver, test_file['filename'], file_info)
+        
+        # Method 1: Direct click with ActionChains
+        print("\nMethod 1: Direct element click")
+        content = download_file_direct_click(driver, test_file['filename'])
+        
+        # Method 2: JavaScript click
+        if not content:
+            print("\nMethod 2: JavaScript click")
+            content = download_file_js(driver, test_file['filename'])
+        
+        # Method 3: Fetch API
+        if not content:
+            print("\nMethod 3: Fetch API")
+            content = download_file_fetch(driver, test_file['filename'])
         
         if not content:
             raise Exception("All download methods failed")
+        
+        print(f"\n✓ Downloaded {len(content)} bytes")
         
         # Process and insert
         file_info = parse_filename(test_file['filename'])
@@ -393,14 +425,14 @@ def main():
         
         if rows:
             table = 'da_price_forecasts' if file_info['type'] == 'da' else 'rt_price_forecasts'
-            print(f"\n  Inserting {len(rows)} rows into {table}")
+            print(f"\nInserting {len(rows)} rows into {table}")
             
             response = supabase.table(table).upsert(
                 rows, 
                 on_conflict='target_timestamp,version,location'
             ).execute()
             
-            print(f"  Response: {response}")
+            print(f"Response: {response}")
             
             supabase.table('processed_files').insert({
                 'filename': test_file['filename'],
@@ -410,12 +442,12 @@ def main():
                 'import_status': 'success'
             }).execute()
             
-            print("\n  ✓ SUCCESS")
+            print("\n✓ SUCCESS")
         else:
             raise Exception("No data parsed")
             
     except Exception as e:
-        print(f"\n  ✗ FAILED: {e}")
+        print(f"\n✗ FAILED: {e}")
         import traceback
         traceback.print_exc()
         
