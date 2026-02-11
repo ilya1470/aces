@@ -1,10 +1,11 @@
 name: Run ACES Scraper
 
 on:
+  push:                # <--- Add this block
+    branches:
+      - main
   schedule:
-    # Runs every 10 minutes
     - cron: '*/10 * * * *'
-  # Allows you to run it manually from the Actions tab for testing
   workflow_dispatch:
 
 jobs:
