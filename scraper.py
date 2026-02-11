@@ -121,7 +121,7 @@ def download_file_js(driver, filename):
     result = driver.execute_script("""
         var filename = arguments[0];
         
-        # Strategy 1: Find by text content and click parent
+        // Strategy 1: Find by text content and click parent
         var allElements = document.querySelectorAll('*');
         for (var i = 0; i < allElements.length; i++) {
             var el = allElements[i];
@@ -132,13 +132,13 @@ def download_file_js(driver, filename):
             }
         }
         
-        # Strategy 2: Find containing element
+        // Strategy 2: Find containing element
         var rows = document.querySelectorAll('tr, .file-row, [role="row"]');
         for (var i = 0; i < rows.length; i++) {
             if (rows[i].textContent.includes(filename)) {
                 console.log('Found row:', rows[i]);
                 
-                # Try double click
+                // Try double click
                 var event = new MouseEvent('dblclick', {
                     'view': window,
                     'bubbles': true,
@@ -329,7 +329,6 @@ def process_csv_content(content, file_info):
         df = pd.read_csv(temp_path)
         print(f"    Shape: {df.shape}, Columns: {list(df.columns)}")
         
-        # Map your CSV columns
         rows = []
         for _, row in df.iterrows():
             try:
@@ -338,7 +337,6 @@ def process_csv_content(content, file_info):
                 hour = int(row['he'])  # Hour ending
                 
                 # Construct datetime
-                from datetime import datetime
                 date_parts = date_str.split('-')
                 target_time = datetime(
                     int(date_parts[0]), int(date_parts[1]), int(date_parts[2]),
@@ -425,9 +423,10 @@ def main():
             table = 'da_price_forecasts' if file_info['type'] == 'da' else 'rt_price_forecasts'
             print(f"\nInserting {len(rows)} rows into {table}")
             
+            # Using the new conflict constraint including 'hour'
             response = supabase.table(table).upsert(
                 rows, 
-                on_conflict='target_timestamp,version,location,hour'  # Added hour to conflict constraint
+                on_conflict='target_timestamp,version,location,hour'
             ).execute()
             
             print(f"Response: {response}")
