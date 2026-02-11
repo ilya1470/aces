@@ -312,7 +312,7 @@ def process_csv_content(content, file_info):
         temp_path.write_bytes(content)
         
         df = pd.read_csv(temp_path)
-        # FORCE LOWERCASE COLUMNS to avoid HE vs he issues
+        # FORCE LOWERCASE COLUMNS
         df.columns = df.columns.str.lower()
         
         print(f"    Shape: {df.shape}, Columns: {list(df.columns)}")
@@ -330,10 +330,17 @@ def process_csv_content(content, file_info):
                     hour - 1, 0, 0
                 )
                 
+                # FIXED: Prioritize 'mw' over 'kw'
+                price_value = None
+                if 'mw' in row and pd.notna(row['mw']):
+                    price_value = float(row['mw'])
+                elif 'kw' in row and pd.notna(row['kw']):
+                    price_value = float(row['kw'])
+                
                 rows.append({
                     'target_timestamp': target_time.isoformat(),
                     'hour': hour,
-                    'price': float(row['kw']) if 'kw' in row else float(row['mw']) if 'mw' in row else None,
+                    'price': price_value,
                     'congestion_price': None,
                     'loss_price': None,
                     'energy_price': None,
@@ -356,7 +363,7 @@ def process_csv_content(content, file_info):
 
 def main():
     print("=" * 60)
-    print("*** RUNNING UPDATED SCRAPER v2.1 ***")
+    print("*** RUNNING UPDATED SCRAPER v2.2 (Loop All + MW Fix) ***")
     print("ACES Price Scraper - Advanced Methods")
     print("=" * 60)
     
@@ -370,80 +377,83 @@ def main():
         login(driver)
         all_files = scan_files(driver)
         new_files = [f for f in all_files if f['filename'] not in processed]
-        print(f"New files: {len(new_files)}")
+        print(f"New files to process: {len(new_files)}")
         
         if not new_files:
             print("Nothing to process")
             return
         
-        # Test first file with multiple methods
-        test_file = new_files[0]
-        print(f"\n{'='*60}")
-        print(f"Testing: {test_file['filename']}")
-        print(f"{'='*60}")
-        
-        content = None
-        
-        # Method 1: Direct click with ActionChains
-        print("\nMethod 1: Direct element click")
-        content = download_file_direct_click(driver, test_file['filename'])
-        
-        # Method 2: JavaScript click
-        if not content:
-            print("\nMethod 2: JavaScript click")
-            content = download_file_js(driver, test_file['filename'])
-        
-        # Method 3: Fetch API
-        if not content:
-            print("\nMethod 3: Fetch API")
-            content = download_file_fetch(driver, test_file['filename'])
-        
-        if not content:
-            raise Exception("All download methods failed")
-        
-        print(f"\n✓ Downloaded {len(content)} bytes")
-        
-        # Process and insert
-        file_info = parse_filename(test_file['filename'])
-        rows = process_csv_content(content, {**file_info, 'filename': test_file['filename']})
-        
-        if rows:
-            table = 'da_price_forecasts' if file_info['type'] == 'da' else 'rt_price_forecasts'
-            print(f"\nInserting {len(rows)} rows into {table}")
+        # FIXED: Loop through ALL new files, not just the first one
+        for file_to_process in new_files:
+            try:
+                print(f"\n{'='*60}")
+                print(f"Processing: {file_to_process['filename']}")
+                print(f"{'='*60}")
+                
+                content = None
+                
+                # Method 1: Direct click
+                content = download_file_direct_click(driver, file_to_process['filename'])
+                
+                # Method 2: JS click
+                if not content:
+                    content = download_file_js(driver, file_to_process['filename'])
+                
+                # Method 3: Fetch API
+                if not content:
+                    content = download_file_fetch(driver, file_to_process['filename'])
+                
+                if not content:
+                    print(f"Skipping {file_to_process['filename']} - Download failed")
+                    continue
+                
+                print(f"\n✓ Downloaded {len(content)} bytes")
+                
+                # Process and insert
+                file_info = parse_filename(file_to_process['filename'])
+                rows = process_csv_content(content, {**file_info, 'filename': file_to_process['filename']})
+                
+                if rows:
+                    table = 'da_price_forecasts' if file_info['type'] == 'da' else 'rt_price_forecasts'
+                    print(f"\nInserting {len(rows)} rows into {table}")
+                    
+                    response = supabase.table(table).upsert(
+                        rows, 
+                        on_conflict='target_timestamp,version,location,hour'
+                    ).execute()
+                    
+                    supabase.table('processed_files').insert({
+                        'filename': file_to_process['filename'],
+                        'file_type': file_info['type'],
+                        'file_size_bytes': len(content),
+                        'row_count': len(rows),
+                        'import_status': 'success'
+                    }).execute()
+                    
+                    print("\n✓ SUCCESS")
+                else:
+                    print("No rows parsed from file")
+                    
+            except Exception as e:
+                print(f"\n✗ FAILED {file_to_process['filename']}: {e}")
+                traceback.print_exc()
+                # Log failure but continue loop
+                try:
+                    supabase.table('processed_files').insert({
+                        'filename': file_to_process['filename'],
+                        'file_type': file_to_process.get('type', 'unknown'),
+                        'import_status': 'failed',
+                        'row_count': 0
+                    }).execute()
+                except:
+                    pass
             
-            response = supabase.table(table).upsert(
-                rows, 
-                on_conflict='target_timestamp,version,location,hour'
-            ).execute()
-            
-            print(f"Response: {response}")
-            
-            supabase.table('processed_files').insert({
-                'filename': test_file['filename'],
-                'file_type': file_info['type'],
-                'file_size_bytes': len(content),
-                'row_count': len(rows),
-                'import_status': 'success'
-            }).execute()
-            
-            print("\n✓ SUCCESS")
-        else:
-            raise Exception("No data parsed")
+            # Small pause between files
+            time.sleep(2)
             
     except Exception as e:
-        print(f"\n✗ FAILED: {e}")
+        print(f"\n✗ GLOBAL FAILURE: {e}")
         traceback.print_exc()
-        
-        try:
-            # Safely attempt to log failure
-            supabase.table('processed_files').insert({
-                'filename': test_file['filename'],
-                'file_type': test_file.get('type', 'unknown'),
-                'import_status': 'failed',
-                'row_count': 0
-            }).execute()
-        except:
-            pass
         
     finally:
         driver.quit()
