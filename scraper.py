@@ -1,17 +1,3 @@
-The error `JavascriptException: Message: javascript error: Invalid or unexpected token` is happening because I inadvertently used Python-style comments (`#`) inside the JavaScript code block. JavaScript requires `//` for comments.
-
-Here is the fixed script.
-
-### **Fixes applied:**
-
-1. **Fixed JS Syntax:** Changed all `#` comments to `//` inside the `download_file_js` function.
-2. **Added Double Click to Method 1:** Since your logs showed Method 1 found the element but a single click didn't work, I added a double-click attempt to the direct click method as well, just to be safe.
-
-### **scraper.py**
-
-(Copy and paste this entire script to replace your current file)
-
-```python
 #!/usr/bin/env python3
 """
 ACES Power Price Scraper - Advanced download methods
@@ -98,6 +84,7 @@ def scan_files(driver):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(1)
     
+    # regex matches filename structure
     files = driver.execute_script("""
         var results = [];
         document.querySelectorAll('tr').forEach(function(row) {
@@ -122,22 +109,19 @@ def scan_files(driver):
 
 def download_file_js(driver, filename):
     """
-    Use JavaScript to trigger download and capture as base64
+    Use JavaScript to trigger download
     """
     print(f"  Attempting JS download: {filename}")
     
-    # Enable download behavior
     driver.execute_cdp_cmd('Page.setDownloadBehavior', {
         'behavior': 'allow',
         'downloadPath': '/tmp'
     })
     
-    # Try clicking with different strategies
-    # FIXED: Replaced '#' comments with '//' for JavaScript compatibility
+    # Removed all comments from JS to prevent syntax errors
     result = driver.execute_script("""
         var filename = arguments[0];
         
-        // Strategy 1: Find by text content and click parent
         var allElements = document.querySelectorAll('*');
         for (var i = 0; i < allElements.length; i++) {
             var el = allElements[i];
@@ -148,13 +132,10 @@ def download_file_js(driver, filename):
             }
         }
         
-        // Strategy 2: Find containing element
         var rows = document.querySelectorAll('tr, .file-row, [role="row"]');
         for (var i = 0; i < rows.length; i++) {
             if (rows[i].textContent.includes(filename)) {
                 console.log('Found row:', rows[i]);
-                
-                // Try double click
                 var event = new MouseEvent('dblclick', {
                     'view': window,
                     'bubbles': true,
@@ -164,14 +145,12 @@ def download_file_js(driver, filename):
                 return 'dblclicked_row';
             }
         }
-        
         return 'not_found';
     """, filename)
     
     print(f"  Click result: {result}")
     time.sleep(5)
     
-    # Check for downloaded file
     files = glob.glob('/tmp/*.csv') + glob.glob('/tmp/*.crdownload')
     print(f"  Files found: {files}")
     
@@ -186,27 +165,20 @@ def download_file_js(driver, filename):
 
 def download_file_fetch(driver, filename):
     """
-    Use fetch API to download file and return base64
+    Use fetch API to download file
     """
     print(f"  Attempting fetch download: {filename}")
     
-    # Get base URL and cookies
-    base_url = driver.current_url
-    
-    # Try to find download URL patterns from the page
+    # Removed comments from JS
     result = driver.execute_async_script("""
         var callback = arguments[arguments.length - 1];
         var filename = arguments[0];
-        
-        // Look for any elements that might have download URLs
         var elements = document.querySelectorAll('[ng-click], [onclick], [data-download]');
         var urls = [];
-        
         elements.forEach(function(el) {
             var onclick = el.getAttribute('onclick') || '';
             var ngClick = el.getAttribute('ng-click') || '';
             var dataDownload = el.getAttribute('data-download') || '';
-            
             if (onclick.includes('download') || ngClick.includes('download') || dataDownload) {
                 urls.push({
                     onclick: onclick,
@@ -216,14 +188,10 @@ def download_file_fetch(driver, filename):
                 });
             }
         });
-        
-        // Try to trigger download using fetch
-        // First, let's look for the file in any exposed JavaScript variables
         var fileData = null;
         if (window.files && window.files[filename]) {
             fileData = window.files[filename];
         }
-        
         callback({
             urls: urls,
             fileData: fileData,
@@ -233,16 +201,9 @@ def download_file_fetch(driver, filename):
     
     print(f"  Page analysis: {result}")
     
-    # If we found URL patterns, try to construct download URL
-    # Try common patterns for Web Transfer / Angular apps
-    encoded = filename.replace('.', '%2E').replace('_', '%5F')
-    
-    # Use browser's fetch with cookies
     fetch_result = driver.execute_async_script("""
         var callback = arguments[arguments.length - 1];
         var filename = arguments[0];
-        
-        // Try to download using fetch
         fetch('/api/files/' + filename, {
             method: 'GET',
             credentials: 'include'
@@ -266,7 +227,6 @@ def download_file_fetch(driver, filename):
     print(f"  Fetch result: {fetch_result}")
     
     if fetch_result and fetch_result.get('success'):
-        # Decode base64 data
         data_url = fetch_result['data']
         if ',' in data_url:
             base64_data = data_url.split(',')[1]
@@ -280,39 +240,43 @@ def download_file_direct_click(driver, filename):
     """
     print(f"  Attempting direct click: {filename}")
     
-    # Save screenshot before
     driver.save_screenshot('/tmp/before_click.png')
-    print("  Screenshot saved: before_click.png")
     
     try:
         # Find element containing the text
         element = driver.find_element(By.XPATH, f"//*[contains(text(), '{filename}')]")
         print(f"  Found element: {element.tag_name}")
         
-        # Scroll into view
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
         time.sleep(1)
         
-        # Save screenshot after scroll
-        driver.save_screenshot('/tmp/after_scroll.png')
-        
-        # Click using ActionChains - Single Click
         actions = ActionChains(driver)
-        actions.move_to_element(element).click().perform()
-        print("  Clicked element (Single)")
-        time.sleep(3)
         
-        # Check for download
+        # 1. Try clicking the element itself
+        print("  Clicking element directly...")
+        actions.move_to_element(element).click().perform()
+        time.sleep(3)
         files = glob.glob('/tmp/*.csv') + glob.glob('/tmp/*.crdownload')
         
-        # If no files, try Double Click
+        # 2. If that failed, try clicking the parent (common in grids)
         if not files:
-            print("  No files after single click, attempting Double Click...")
+            print("  No download. Clicking parent element...")
+            try:
+                parent = element.find_element(By.XPATH, "./..")
+                actions.move_to_element(parent).click().perform()
+                time.sleep(3)
+                files = glob.glob('/tmp/*.csv') + glob.glob('/tmp/*.crdownload')
+            except:
+                print("  Could not click parent")
+
+        # 3. If that failed, try Double Click
+        if not files:
+            print("  No download. Attempting Double Click...")
             actions.double_click(element).perform()
             time.sleep(5)
             files = glob.glob('/tmp/*.csv') + glob.glob('/tmp/*.crdownload')
 
-        print(f"  Files after click: {files}")
+        print(f"  Files after click attempts: {files}")
         
         if files:
             files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
@@ -347,20 +311,22 @@ def process_csv_content(content, file_info):
         temp_path.write_bytes(content)
         
         df = pd.read_csv(temp_path)
+        # FORCE LOWERCASE COLUMNS to avoid HE vs he issues
+        df.columns = df.columns.str.lower()
+        
         print(f"    Shape: {df.shape}, Columns: {list(df.columns)}")
         
         rows = []
         for _, row in df.iterrows():
             try:
                 # Parse date and hour
-                date_str = str(row['date'])  # Format likely YYYY-MM-DD
-                hour = int(row['he'])  # Hour ending
+                date_str = str(row['date'])
+                hour = int(row['he'])
                 
-                # Construct datetime
                 date_parts = date_str.split('-')
                 target_time = datetime(
                     int(date_parts[0]), int(date_parts[1]), int(date_parts[2]),
-                    hour - 1, 0, 0  # HE15 = 14:00-15:00, so use hour-1
+                    hour - 1, 0, 0
                 )
                 
                 rows.append({
@@ -443,7 +409,6 @@ def main():
             table = 'da_price_forecasts' if file_info['type'] == 'da' else 'rt_price_forecasts'
             print(f"\nInserting {len(rows)} rows into {table}")
             
-            # Using the new conflict constraint including 'hour'
             response = supabase.table(table).upsert(
                 rows, 
                 on_conflict='target_timestamp,version,location,hour'
@@ -483,5 +448,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-```
