@@ -43,4 +43,7 @@ jobs:
           # ACES credentials
           ACES_USERNAME: ${{ secrets.ACES_USERNAME }}
           ACES_PASSWORD: ${{ secrets.ACES_PASSWORD }}
+
+          # Log to projects
+          LOG_PROCESSED_IN_PROJECTS: "ilya,staging,main"
         run: python scraper.py
