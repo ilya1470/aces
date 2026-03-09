@@ -20,10 +20,32 @@ import pandas as pd
 import glob
 import traceback
 
+# imports for parallel inserts to multiple Supabase projects
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
 ACES_USER = os.environ.get('ACES_USERNAME')
 ACES_PASS = os.environ.get('ACES_PASSWORD')
+
+#additional Supabase projects (staging + main)
+SUPABASE_URL_STAGING = os.environ.get("SUPABASE_URL_STAGING")
+SUPABASE_KEY_STAGING = os.environ.get("SUPABASE_SERVICE_ROLE_KEY_STAGING")
+
+SUPABASE_URL_MAIN = os.environ.get("SUPABASE_URL_MAIN")
+SUPABASE_KEY_MAIN = os.environ.get("SUPABASE_SERVICE_ROLE_KEY_MAIN")
+
+#control where processed_files is logged (default only ilya)
+LOG_PROCESSED_IN_PROJECTS = [
+    p.strip().lower()
+    for p in os.environ.get("LOG_PROCESSED_IN_PROJECTS", "ilya").split(",")
+    if p.strip()
+]
+
+#concurrency + upsert conflict config
+MAX_UPSERT_WORKERS = int(os.environ.get("MAX_UPSERT_WORKERS", "3"))
+UPSERT_ON_CONFLICT = "target_timestamp,version,location,hour"
+
 
 def init_browser():
     chrome_options = Options()
@@ -36,7 +58,7 @@ def init_browser():
         "download.prompt_for_download": False,
         "safebrowsing.enabled": False
     })
-    
+
     driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
         options=chrome_options
@@ -44,46 +66,76 @@ def init_browser():
     driver.implicitly_wait(5)
     return driver
 
+
 def login(driver):
     print("Logging in...")
     driver.get("https://de.acespower.com/Web/Account/Login.htm")
     time.sleep(3)
-    
+
     driver.find_element(By.NAME, "username").send_keys(ACES_USER)
     driver.find_element(By.NAME, "password").send_keys(ACES_PASS)
-    
+
     try:
         driver.find_element(By.ID, "loginSubmit").click()
     except:
         driver.find_element(By.NAME, "password").submit()
-    
+
     time.sleep(5)
     current_url = driver.current_url
     print(f"URL after login: {current_url}")
-    
+
     if "Login" in current_url:
         raise Exception("Login failed")
     print("Login successful!")
     return True
 
+
+def _require_env(name: str, value):
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+
+
+def build_supabase_targets():
+    """
+    NEW: build clients for ilya + staging + main (3 separate Supabase projects)
+    """
+    _require_env("SUPABASE_URL", SUPABASE_URL)
+    _require_env("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY)
+
+    _require_env("SUPABASE_URL_STAGING", SUPABASE_URL_STAGING)
+    _require_env("SUPABASE_SERVICE_ROLE_KEY_STAGING", SUPABASE_KEY_STAGING)
+
+    _require_env("SUPABASE_URL_MAIN", SUPABASE_URL_MAIN)
+    _require_env("SUPABASE_SERVICE_ROLE_KEY_MAIN", SUPABASE_KEY_MAIN)
+
+    return {
+        "ilya": {"url": SUPABASE_URL, "key": SUPABASE_KEY},
+        "staging": {"url": SUPABASE_URL_STAGING, "key": SUPABASE_KEY_STAGING},
+        "main": {"url": SUPABASE_URL_MAIN, "key": SUPABASE_KEY_MAIN},
+    }
+
+
 def get_processed_files(supabase):
+    # only treat files as processed if import_status == 'success'
+    # so failures get retried next run.
     try:
-        response = supabase.table('processed_files').select('filename').execute()
+        response = supabase.table('processed_files').select('filename').eq('import_status', 'success').execute()
         return set([f['filename'] for f in response.data])
     except Exception as e:
         print(f"Error fetching processed files: {e}")
         return set()
+
 
 def scan_files(driver):
     print("Scanning for files...")
     if "/#/" not in driver.current_url:
         driver.get("https://de.acespower.com#/")
         time.sleep(3)
-    
+
     for i in range(5):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(1)
-    
+
     # regex matches filename structure
     files = driver.execute_script("""
         var results = [];
@@ -96,32 +148,33 @@ def scan_files(driver):
         });
         return results;
     """)
-    
+
     seen = set()
     unique = []
     for f in files:
         if f['filename'] not in seen:
             seen.add(f['filename'])
             unique.append(f)
-    
+
     print(f"Found {len(unique)} unique files")
     return unique
+
 
 def download_file_js(driver, filename):
     """
     Use JavaScript to trigger download
     """
     print(f"  Attempting JS download: {filename}")
-    
+
     driver.execute_cdp_cmd('Page.setDownloadBehavior', {
         'behavior': 'allow',
         'downloadPath': '/tmp'
     })
-    
+
     # Clean JS execution without Python comments
     result = driver.execute_script("""
         var filename = arguments[0];
-        
+
         var allElements = document.querySelectorAll('*');
         for (var i = 0; i < allElements.length; i++) {
             var el = allElements[i];
@@ -131,7 +184,7 @@ def download_file_js(driver, filename):
                 return 'clicked_exact_text';
             }
         }
-        
+
         var rows = document.querySelectorAll('tr, .file-row, [role="row"]');
         for (var i = 0; i < rows.length; i++) {
             if (rows[i].textContent.includes(filename)) {
@@ -147,28 +200,29 @@ def download_file_js(driver, filename):
         }
         return 'not_found';
     """, filename)
-    
+
     print(f"  Click result: {result}")
     time.sleep(5)
-    
+
     files = glob.glob('/tmp/*.csv') + glob.glob('/tmp/*.crdownload')
     print(f"  Files found: {files}")
-    
+
     if files:
         files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
         latest = Path(files[0])
         content = latest.read_bytes()
         latest.unlink()
         return content
-    
+
     return None
+
 
 def download_file_fetch(driver, filename):
     """
     Use fetch API to download file
     """
     print(f"  Attempting fetch download: {filename}")
-    
+
     # Analysis script
     result = driver.execute_async_script("""
         var callback = arguments[arguments.length - 1];
@@ -198,9 +252,9 @@ def download_file_fetch(driver, filename):
             windowKeys: Object.keys(window).filter(k => k.toLowerCase().includes('file')).slice(0, 10)
         });
     """, filename)
-    
+
     print(f"  Page analysis: {result}")
-    
+
     # Fetch execution script
     fetch_result = driver.execute_async_script("""
         var callback = arguments[arguments.length - 1];
@@ -224,41 +278,42 @@ def download_file_fetch(driver, filename):
             callback({success: false, error: error.toString()});
         });
     """, filename)
-    
+
     print(f"  Fetch result: {fetch_result}")
-    
+
     if fetch_result and fetch_result.get('success'):
         data_url = fetch_result['data']
         if ',' in data_url:
             base64_data = data_url.split(',')[1]
             return base64.b64decode(base64_data)
-    
+
     return None
+
 
 def download_file_direct_click(driver, filename):
     """
     Direct click with mouse simulation (Single + Parent + Double Click)
     """
     print(f"  Attempting direct click: {filename}")
-    
+
     driver.save_screenshot('/tmp/before_click.png')
-    
+
     try:
         # Find element containing the text
         element = driver.find_element(By.XPATH, f"//*[contains(text(), '{filename}')]")
         print(f"  Found element: {element.tag_name}")
-        
+
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
         time.sleep(1)
-        
+
         actions = ActionChains(driver)
-        
+
         # 1. Try clicking the element itself
         print("  Clicked element (Single)")
         actions.move_to_element(element).click().perform()
         time.sleep(3)
         files = glob.glob('/tmp/*.csv') + glob.glob('/tmp/*.crdownload')
-        
+
         # 2. If that failed, try clicking the parent (common in grids)
         if not files:
             print("  No download. Clicking parent element...")
@@ -278,18 +333,19 @@ def download_file_direct_click(driver, filename):
             files = glob.glob('/tmp/*.csv') + glob.glob('/tmp/*.crdownload')
 
         print(f"  Files after click attempts: {files}")
-        
+
         if files:
             files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
             latest = Path(files[0])
             content = latest.read_bytes()
             latest.unlink()
             return content
-            
+
     except Exception as e:
         print(f"  Direct click error: {e}")
-    
+
     return None
+
 
 def parse_filename(filename):
     match = re.match(r'NIPS\.WVPA_(da|rt)_price_forecast_(\d{14})\.csv', filename)
@@ -306,37 +362,38 @@ def parse_filename(filename):
         }
     return None
 
+
 def process_csv_content(content, file_info):
     try:
         temp_path = Path('/tmp') / file_info['filename']
         temp_path.write_bytes(content)
-        
+
         df = pd.read_csv(temp_path)
         # FORCE LOWERCASE COLUMNS
         df.columns = df.columns.str.lower()
-        
+
         print(f"    Shape: {df.shape}, Columns: {list(df.columns)}")
-        
+
         rows = []
         for _, row in df.iterrows():
             try:
                 # Parse date and hour
                 date_str = str(row['date'])
                 hour = int(row['he'])
-                
+
                 date_parts = date_str.split('-')
                 target_time = datetime(
                     int(date_parts[0]), int(date_parts[1]), int(date_parts[2]),
                     hour - 1, 0, 0
                 )
-                
+
                 # FIXED: Prioritize 'mw' over 'kw'
                 price_value = None
                 if 'mw' in row and pd.notna(row['mw']):
                     price_value = float(row['mw'])
                 elif 'kw' in row and pd.notna(row['kw']):
                     price_value = float(row['kw'])
-                
+
                 rows.append({
                     'target_timestamp': target_time.isoformat(),
                     'hour': hour,
@@ -352,7 +409,7 @@ def process_csv_content(content, file_info):
             except Exception as e:
                 print(f"    Row error: {e}")
                 continue
-        
+
         temp_path.unlink()
         print(f"    Parsed {len(rows)} rows")
         return rows
@@ -361,102 +418,188 @@ def process_csv_content(content, file_info):
         traceback.print_exc()
         return []
 
+
+def upsert_rows_to_all_projects(project_targets, table_name, rows, on_conflict):
+    """
+    NEW: Upsert to ilya + staging + main in parallel.
+    Uses a fresh Supabase client per thread.
+    Fails the whole operation if ANY project fails.
+    """
+    def worker(project_name, url, key):
+        sb = create_client(url, key)
+        sb.table(table_name).upsert(rows, on_conflict=on_conflict).execute()
+        return project_name
+
+    errors = []
+    successes = []
+
+    max_workers = min(MAX_UPSERT_WORKERS, len(project_targets)) or 1
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = []
+        for name, cfg in project_targets.items():
+            futures.append(ex.submit(worker, name, cfg["url"], cfg["key"]))
+
+        for fut in as_completed(futures):
+            try:
+                successes.append(fut.result())
+            except Exception as e:
+                errors.append(str(e))
+
+    if errors:
+        raise RuntimeError(f"One or more project upserts failed. Success={successes}. Errors={errors}")
+
+    return successes
+
+
+def log_processed_file(project_targets, filename, file_type, file_size_bytes, row_count, import_status):
+    """
+    NEW: log to processed_files (default only ilya). Uses upsert on filename PK.
+    Control via LOG_PROCESSED_IN_PROJECTS env var.
+    """
+    payload = {
+        'filename': filename,
+        'file_type': file_type,
+        'file_size_bytes': file_size_bytes,
+        'row_count': row_count,
+        'import_status': import_status
+    }
+
+    for project_name in LOG_PROCESSED_IN_PROJECTS:
+        if project_name not in project_targets:
+            continue
+        cfg = project_targets[project_name]
+        sb = create_client(cfg["url"], cfg["key"])
+        sb.table('processed_files').upsert(payload, on_conflict='filename').execute()
+
+
 def main():
     print("=" * 60)
-    print("*** RUNNING UPDATED SCRAPER v2.2 (Loop All + MW Fix) ***")
+    print("*** RUNNING UPDATED SCRAPER v3.0 (3 Supabase projects: ilya + staging + main) ***")
     print("ACES Price Scraper - Advanced Methods")
     print("=" * 60)
-    
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    # Build project targets and use ilya processed_files as the source of truth
+    project_targets = build_supabase_targets()
+    supabase = create_client(project_targets["ilya"]["url"], project_targets["ilya"]["key"])
+
     processed = get_processed_files(supabase)
     print(f"Already processed: {len(processed)}")
-    
+
     driver = init_browser()
-    
+
     try:
         login(driver)
         all_files = scan_files(driver)
         new_files = [f for f in all_files if f['filename'] not in processed]
         print(f"New files to process: {len(new_files)}")
-        
+
         if not new_files:
             print("Nothing to process")
             return
-        
+
         # FIXED: Loop through ALL new files, not just the first one
         for file_to_process in new_files:
             try:
                 print(f"\n{'='*60}")
                 print(f"Processing: {file_to_process['filename']}")
                 print(f"{'='*60}")
-                
+
                 content = None
-                
+
                 # Method 1: Direct click
                 content = download_file_direct_click(driver, file_to_process['filename'])
-                
+
                 # Method 2: JS click
                 if not content:
                     content = download_file_js(driver, file_to_process['filename'])
-                
+
                 # Method 3: Fetch API
                 if not content:
                     content = download_file_fetch(driver, file_to_process['filename'])
-                
+
                 if not content:
                     print(f"Skipping {file_to_process['filename']} - Download failed")
+                    # Mark failed so it can retry later (since we only skip success)
+                    log_processed_file(
+                        project_targets,
+                        filename=file_to_process['filename'],
+                        file_type=file_to_process.get('type', 'unknown'),
+                        file_size_bytes=None,
+                        row_count=0,
+                        import_status='failed'
+                    )
                     continue
-                
+
                 print(f"\n✓ Downloaded {len(content)} bytes")
-                
+
                 # Process and insert
                 file_info = parse_filename(file_to_process['filename'])
                 rows = process_csv_content(content, {**file_info, 'filename': file_to_process['filename']})
-                
+
                 if rows:
                     table = 'da_price_forecasts' if file_info['type'] == 'da' else 'rt_price_forecasts'
                     print(f"\nInserting {len(rows)} rows into {table}")
-                    
-                    response = supabase.table(table).upsert(
-                        rows, 
-                        on_conflict='target_timestamp,version,location,hour'
-                    ).execute()
-                    
-                    supabase.table('processed_files').insert({
-                        'filename': file_to_process['filename'],
-                        'file_type': file_info['type'],
-                        'file_size_bytes': len(content),
-                        'row_count': len(rows),
-                        'import_status': 'success'
-                    }).execute()
-                    
+
+                    #single-project upsert -> multi-project parallel upsert
+                    successes = upsert_rows_to_all_projects(
+                        project_targets=project_targets,
+                        table_name=table,
+                        rows=rows,
+                        on_conflict=UPSERT_ON_CONFLICT
+                    )
+                    print(f"✓ Upsert success in: {successes}")
+
+                    #processed_files uses upsert + marks success only if all projects succeeded
+                    log_processed_file(
+                        project_targets,
+                        filename=file_to_process['filename'],
+                        file_type=file_info['type'],
+                        file_size_bytes=len(content),
+                        row_count=len(rows),
+                        import_status='success'
+                    )
+
                     print("\n✓ SUCCESS")
                 else:
                     print("No rows parsed from file")
-                    
+                    # Mark failed parse so it can retry later
+                    log_processed_file(
+                        project_targets,
+                        filename=file_to_process['filename'],
+                        file_type=file_info['type'] if file_info else file_to_process.get('type', 'unknown'),
+                        file_size_bytes=len(content),
+                        row_count=0,
+                        import_status='failed'
+                    )
+
             except Exception as e:
                 print(f"\n✗ FAILED {file_to_process['filename']}: {e}")
                 traceback.print_exc()
                 # Log failure but continue loop
                 try:
-                    supabase.table('processed_files').insert({
-                        'filename': file_to_process['filename'],
-                        'file_type': file_to_process.get('type', 'unknown'),
-                        'import_status': 'failed',
-                        'row_count': 0
-                    }).execute()
+                    #log failure via helper (upsert), so reruns don't error on PK
+                    file_info2 = parse_filename(file_to_process['filename'])
+                    log_processed_file(
+                        project_targets,
+                        filename=file_to_process['filename'],
+                        file_type=(file_info2['type'] if file_info2 else file_to_process.get('type', 'unknown')),
+                        file_size_bytes=None,
+                        row_count=0,
+                        import_status='failed'
+                    )
                 except:
                     pass
-            
+
             # Small pause between files
             time.sleep(2)
-            
+
     except Exception as e:
         print(f"\n✗ GLOBAL FAILURE: {e}")
         traceback.print_exc()
-        
+
     finally:
         driver.quit()
+
 
 if __name__ == "__main__":
     main()
